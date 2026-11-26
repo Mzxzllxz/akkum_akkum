@@ -2,6 +2,8 @@ import * as THREE from 'three'
 
 export type View = 'outside' | 'inside'
 export type SceneState = { inside: boolean; canSit: boolean; sitting: boolean }
+// 위치(x,z)·바라보는 방향(f)·앉은 좌석 번호(s, 없으면 -1)·동작(g)
+export type Pose = { x: number; z: number; f: number; s: number; g: string }
 export interface ChapelScene {
   setMove(x: number, y: number): void
   goto(view: View): void
@@ -14,13 +16,18 @@ export interface ChapelScene {
   gesture(g: 'pray' | 'wave'): void
   toggleSit(): void
   ringBell(): void
+  getPose(): Pose
+  setMe(name: string, hue: number): void
+  setPeer(id: string, info: { name: string; hue: number } | null): void
+  movePeer(id: string, pose: Pose): void
+  say(id: string | null, text: string): void
   snapshot(): Promise<Blob | null>
   dispose(): void
 }
 
 // 예배당 안쪽 치수(미터). 정문은 +z, 강단은 -z.
 const HALF_W = 6, HALF_L = 10, WALL_H = 6, WALL_T = 0.4, DOOR_W = 2.4
-const PLAYER_R = 0.35, WALK_SPEED = 3.2, WORLD_R = 80, MAX_CANDLES = 24
+const PLAYER_R = 0.35, WALK_SPEED = 3.2, WORLD_R = 80, MAX_CANDLES = 24, MAX_PEERS = 60
 
 type Box = [minX: number, maxX: number, minZ: number, maxZ: number]
 
@@ -249,24 +256,78 @@ export function createScene(host: HTMLElement, onState: (s: SceneState) => void)
   light(0xffc98a, 14, 10, 0, 2.6, endZ + 1.6)
 
   // ── 내 캐릭터 ────────────────────────────────────────────
-  const avatar = new THREE.Group()
-  const coat = std(0xa83c3c)
-  put(new THREE.Mesh(new THREE.CapsuleGeometry(0.26, 0.42, 4, 10), coat), 0, 0.85, 0, avatar)
-  const head = put(new THREE.Group(), 0, 1.42, 0, avatar)
-  head.add(new THREE.Mesh(new THREE.SphereGeometry(0.23, 16, 12), std(0xf1c9a5)))
-  put(new THREE.Mesh(new THREE.SphereGeometry(0.245, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2), std(0x2e5a4c)), 0, 0.03, 0, head)
-  put(new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 6), snowy), 0, 0.3, 0, head)
-  const eyeGeo = new THREE.SphereGeometry(0.025, 6, 6), eyeMat = std(0x1c1c22)
-  for (const s of [-1, 1]) put(new THREE.Mesh(eyeGeo, eyeMat), s * 0.08, -0.02, 0.21, head)
-  const limb = (x: number, y: number, r: number, len: number, m: THREE.Material) => {
-    const pivot = put(new THREE.Group(), x, y, 0, avatar)
-    put(new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 8), m), 0, -len / 2, 0, pivot)
-    return pivot
+  const skin = std(0xf1c9a5), hatMat = std(0x2e5a4c), eyeMat = std(0x1c1c22), trousers = std(0x2b3140)
+  const bodyGeo = new THREE.CapsuleGeometry(0.26, 0.42, 4, 10), headGeo = new THREE.SphereGeometry(0.23, 16, 12)
+  const hatGeo = new THREE.SphereGeometry(0.245, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2)
+  const pomGeo = new THREE.SphereGeometry(0.07, 8, 6), eyeGeo = new THREE.SphereGeometry(0.025, 6, 6)
+  const legGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.46, 8), armGeo = new THREE.CylinderGeometry(0.065, 0.065, 0.42, 8)
+  const makeAvatar = (hue: number) => {
+    const group = new THREE.Group()
+    const coat = std(0xffffff)
+    coat.color.setHSL(hue / 360, 0.55, 0.4)
+    put(new THREE.Mesh(bodyGeo, coat), 0, 0.85, 0, group)
+    const head = put(new THREE.Group(), 0, 1.42, 0, group)
+    head.add(new THREE.Mesh(headGeo, skin))
+    put(new THREE.Mesh(hatGeo, hatMat), 0, 0.03, 0, head)
+    put(new THREE.Mesh(pomGeo, snowy), 0, 0.3, 0, head)
+    for (const s of [-1, 1]) put(new THREE.Mesh(eyeGeo, eyeMat), s * 0.08, -0.02, 0.21, head)
+    const limb = (x: number, y: number, geo: THREE.CylinderGeometry, m: THREE.Material) => {
+      const pivot = put(new THREE.Group(), x, y, 0, group)
+      put(new THREE.Mesh(geo, m), 0, -geo.parameters.height / 2, 0, pivot)
+      return pivot
+    }
+    const legs = [-1, 1].map(s => limb(s * 0.11, 0.48, legGeo, trousers))
+    const arms = [-1, 1].map(s => limb(s * 0.3, 1.08, armGeo, coat))
+    scene.add(group)
+    return { group, head, legs, arms, coat, phase: 0, bubbleT: 0, label: null as THREE.Sprite | null, bubble: null as THREE.Sprite | null }
   }
-  const trousers = std(0x2b3140)
-  const legs = [-1, 1].map(s => limb(s * 0.11, 0.48, 0.08, 0.46, trousers))
-  const arms = [-1, 1].map(s => limb(s * 0.3, 1.08, 0.065, 0.42, coat))
-  scene.add(avatar)
+  type Avatar = ReturnType<typeof makeAvatar>
+  const animate = (a: Avatar, moving: boolean, sit: boolean, g: string, dt: number, now: number) => {
+    if (moving) a.phase += dt * 9
+    const swing = moving ? Math.sin(a.phase) * 0.6 : 0
+    a.legs.forEach((l, i) => (l.rotation.x = sit ? -Math.PI / 2 : i ? -swing : swing))
+    const pray = g === 'pray', wave = g === 'wave'
+    a.head.rotation.x = pray ? 0.45 : 0
+    a.arms.forEach((arm, i) => {
+      const s = i ? 1 : -1
+      arm.rotation.x = pray ? -1.15 : i ? swing * 0.8 : -swing * 0.8
+      arm.rotation.z = pray ? -s * 0.4 : wave && i ? 2.6 + Math.sin(now * 0.012) * 0.3 : s * 0.12
+    })
+    if (a.bubble && (a.bubbleT -= dt) <= 0) setSprite(a, 'bubble', '')
+  }
+  // 이름표·말풍선: 글자를 캔버스에 그려 스프라이트로 띄움(HTML로 넣지 않으므로 남이 보낸 글자도 안전)
+  const textSprite = (text: string, bubble: boolean) => {
+    const c = document.createElement('canvas'), x = c.getContext('2d')!
+    const font = '600 40px "Pretendard", "Noto Sans KR", sans-serif'
+    x.font = font
+    c.width = Math.min(1024, Math.ceil(x.measureText(text).width) + 48)
+    c.height = 72
+    x.font = font // 캔버스 크기를 바꾸면 설정이 초기화됨
+    x.fillStyle = bubble ? 'rgba(244,236,220,0.95)' : 'rgba(10,20,32,0.55)'
+    x.beginPath()
+    x.roundRect(0, 0, c.width, c.height, 28)
+    x.fill()
+    x.fillStyle = bubble ? '#1a1408' : '#f4ecdc'
+    x.textAlign = 'center'
+    x.textBaseline = 'middle'
+    x.fillText(text, c.width / 2, c.height / 2 + 2, c.width - 32)
+    const tex = new THREE.CanvasTexture(c)
+    tex.colorSpace = THREE.SRGBColorSpace
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }))
+    sprite.scale.set((c.width / c.height) * 0.3, 0.3, 1)
+    return sprite
+  }
+  const setSprite = (a: Avatar, key: 'label' | 'bubble', text: string) => {
+    const old = a[key]
+    if (old) {
+      old.material.map?.dispose()
+      old.material.dispose()
+      a.group.remove(old)
+    }
+    a[key] = text ? put(textSprite(text, key === 'bubble'), 0, key === 'bubble' ? 2.3 : 1.92, 0, a.group) : null
+  }
+  const me = makeAvatar(0)
+  const peers = new Map<string, { av: Avatar; pose: Pose }>()
 
   // ── 눈 ──────────────────────────────────────────────────
   const SNOW = 1800, SX = 60, SY = 26
@@ -293,7 +354,7 @@ export function createScene(host: HTMLElement, onState: (s: SceneState) => void)
   const OUTSIDE_Z = 31, INSIDE_Z = 6.5
   const pos = { x: 0, z: OUTSIDE_Z }
   let facing = Math.PI, yaw = 0, pitch = 0.28, dist = 5
-  let sitting = -1, walkPhase = 0, bellT = 0, slowMotion = false, time = 0
+  let sitting = -1, bellT = 0, slowMotion = false, time = 0
   let gesture: { type: 'pray' | 'wave'; t: number } | null = null
   const joy = { x: 0, y: 0 }
   const keys = new Set<string>()
@@ -303,9 +364,11 @@ export function createScene(host: HTMLElement, onState: (s: SceneState) => void)
   const isInside = () => Math.abs(pos.x) < HALF_W && Math.abs(pos.z) < HALF_L
   const nearestSeat = () => {
     let best = -1, bestD = 1.6
+    // ponytail: 동시에 같은 자리를 누르면 둘 다 앉게 됨. 문제되면 좌석 점유를 DB(유일 제약)로 옮길 것.
+    const taken = new Set([...peers.values()].map(p => p.pose.s))
     seats.forEach((s, i) => {
       const d = Math.hypot(s.x - pos.x, s.z - pos.z)
-      if (d < bestD) (best = i), (bestD = d)
+      if (d < bestD && !taken.has(i)) (best = i), (bestD = d)
     })
     return best
   }
@@ -368,21 +431,19 @@ export function createScene(host: HTMLElement, onState: (s: SceneState) => void)
       if (!blocked(pos.x, pos.z + mz * step)) pos.z += mz * step
       const turn = wrap(Math.atan2(mx, mz) - facing + Math.PI, Math.PI * 2) - Math.PI
       facing += turn * Math.min(1, dt * 10)
-      walkPhase += dt * 9
     }
 
-    avatar.position.set(pos.x, sitting >= 0 ? 0.1 : 0, pos.z)
-    avatar.rotation.y = facing
-    const swing = moving ? Math.sin(walkPhase) * 0.6 : 0
-    legs.forEach((l, i) => (l.rotation.x = sitting >= 0 ? -Math.PI / 2 : i ? -swing : swing))
+    me.group.position.set(pos.x, sitting >= 0 ? 0.1 : 0, pos.z)
+    me.group.rotation.y = facing
     if (gesture && (gesture.t -= dt) <= 0) gesture = null
-    const pray = gesture?.type === 'pray', wave = gesture?.type === 'wave'
-    head.rotation.x = pray ? 0.45 : 0
-    arms.forEach((a, i) => {
-      const s = i ? 1 : -1
-      a.rotation.x = pray ? -1.15 : i ? swing * 0.8 : -swing * 0.8
-      a.rotation.z = pray ? -s * 0.4 : wave && i ? 2.6 + Math.sin(now * 0.012) * 0.3 : s * 0.12
-    })
+    animate(me, moving, sitting >= 0, gesture?.type ?? '', dt, now)
+    const ease = 1 - Math.exp(-dt * 8) // 다른 방문자는 받은 위치로 부드럽게 따라감
+    for (const { av, pose } of peers.values()) {
+      const g = av.group, dx = pose.x - g.position.x, dz = pose.z - g.position.z
+      g.position.set(g.position.x + dx * ease, pose.s >= 0 ? 0.1 : 0, g.position.z + dz * ease)
+      g.rotation.y += (wrap(pose.f - g.rotation.y + Math.PI, Math.PI * 2) - Math.PI) * ease
+      animate(av, Math.hypot(dx, dz) > 0.05, pose.s >= 0, pose.g, dt, now)
+    }
 
     const inside = isInside()
     const ty = sitting >= 0 ? 1.2 : 1.35
@@ -453,6 +514,47 @@ export function createScene(host: HTMLElement, onState: (s: SceneState) => void)
       facing = Math.PI
     },
     ringBell() { bellT = 3 },
+    getPose: () => ({ x: pos.x, z: pos.z, f: facing, s: sitting, g: gesture?.type ?? '' }),
+    setMe(name, hue) {
+      me.coat.color.setHSL(hue / 360, 0.55, 0.4)
+      setSprite(me, 'label', name)
+    },
+    setPeer(id, info) {
+      let p = peers.get(id)
+      if (!info) {
+        if (!p) return
+        setSprite(p.av, 'label', '')
+        setSprite(p.av, 'bubble', '')
+        p.av.coat.dispose()
+        scene.remove(p.av.group)
+        peers.delete(id)
+        return
+      }
+      if (!p) {
+        if (peers.size >= MAX_PEERS) return
+        p = { av: makeAvatar(info.hue), pose: { x: 0, z: 0, f: 0, s: -1, g: '' } }
+        p.av.group.visible = false // 첫 위치를 받을 때까지 숨김
+        peers.set(id, p)
+      }
+      p.av.coat.color.setHSL(info.hue / 360, 0.55, 0.4)
+      setSprite(p.av, 'label', info.name)
+    },
+    movePeer(id, pose) {
+      const p = peers.get(id)
+      if (!p) return
+      p.pose = pose
+      if (!p.av.group.visible) {
+        p.av.group.position.set(pose.x, 0, pose.z)
+        p.av.group.rotation.y = pose.f
+        p.av.group.visible = true
+      }
+    },
+    say(id, text) {
+      const a = id ? peers.get(id)?.av : me
+      if (!a) return
+      setSprite(a, 'bubble', text)
+      a.bubbleT = 6
+    },
     snapshot() {
       renderer.render(scene, camera) // 같은 태스크 안에서 읽어야 버퍼가 비워지기 전
       return new Promise(res => el.toBlob(res, 'image/png'))

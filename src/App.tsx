@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type PointerEvent, type ReactNode } from 'react'
 import { BRAND, TAGLINE, TRACKS, VERSES } from './data'
+import { CHAT_MAX, NAME_MAX, cleanName, db, joinRoom, signIn, type Room } from './net'
 import { createScene, type ChapelScene, type SceneState } from './scene'
 
 type Prayer = { id: number; name: string; text: string; at: number }
+type PrayerView = Prayer & { mine: boolean; amens: number; amened: boolean }
 type Saved = {
   candles: number
   lastCandle: string
@@ -12,6 +14,8 @@ type Saved = {
   highQuality: boolean
   reduceMotion: boolean
   volume: number
+  name: string
+  hue: number
 }
 const DEFAULTS: Saved = {
   candles: 0,
@@ -22,10 +26,13 @@ const DEFAULTS: Saved = {
   highQuality: true,
   reduceMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
   volume: 0.4,
+  name: '',
+  hue: Math.floor(Math.random() * 360), // 내 외투 색. 처음 한 번 정해져 저장됨
 }
 const STORE_KEY = 'chapel:v1'
 const PRAYER_MAX = 400
 const today = () => new Date().toLocaleDateString('sv') // YYYY-MM-DD (현지 날짜)
+const kstToday = () => new Date().toLocaleDateString('sv', { timeZone: 'Asia/Seoul' }) // DB의 촛불 날짜 기준과 같게
 const mmss = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
 function loadSaved(): Saved {
@@ -136,6 +143,21 @@ export default function App() {
   const [endAt, setEndAt] = useState<number | null>(null)
   const [now, setNow] = useState(Date.now)
   const left = endAt ? Math.max(0, Math.ceil((endAt - now) / 1000)) : duration
+  // 함께하기(실시간). uid가 없으면 기도·촛불은 이 기기에만 저장된다.
+  const room = useRef<Room | null>(null)
+  const volume = useRef(saved.volume)
+  const [uid, setUid] = useState<string | null>(null)
+  const [online, setOnline] = useState(false)
+  const [peerCount, setPeerCount] = useState(0)
+  const [chatOpen, setChatOpen] = useState(false)
+  const [chatLog, setChatLog] = useState<{ id: number; who: string; text: string }[]>([])
+  const [shared, setShared] = useState<PrayerView[]>([])
+  const [candleTotal, setCandleTotal] = useState(0)
+  const [litOnline, setLitOnline] = useState(false)
+  const [tick, setTick] = useState(0) // 올리면 공유 기도·촛불을 다시 읽음
+  const reload = () => setTick(t => t + 1)
+  const myName = cleanName(saved.name)
+  const log = (who: string, text: string) => setChatLog(l => [...l.slice(-5), { id: Math.random(), who, text }])
 
   useEffect(() => {
     try {
@@ -160,7 +182,70 @@ export default function App() {
   useEffect(() => { scene.current?.setProjector(saved.projector) }, [saved.projector])
   useEffect(() => { scene.current?.setQuality(saved.highQuality) }, [saved.highQuality])
   useEffect(() => { scene.current?.setReduceMotion(saved.reduceMotion) }, [saved.reduceMotion])
-  useEffect(() => { scene.current?.setCandles(saved.candles) }, [saved.candles])
+  useEffect(() => {
+    void signIn().then(setUid)
+    const names = new Map<string, string>()
+    const r = joinRoom(() => scene.current?.getPose() ?? { x: 0, z: 0, f: 0, s: -1, g: '' }, {
+      onStatus: setOnline,
+      onPeers(peers) {
+        for (const id of [...names.keys()]) {
+          if (peers.has(id)) continue
+          scene.current?.setPeer(id, null)
+          names.delete(id)
+        }
+        for (const [id, p] of peers) {
+          scene.current?.setPeer(id, p)
+          names.set(id, p.name)
+        }
+        setPeerCount(peers.size)
+      },
+      onPose: (id, pose) => scene.current?.movePeer(id, pose),
+      onChat(id, text) {
+        scene.current?.say(id, text)
+        log(names.get(id) ?? '이웃', text)
+      },
+      onBell() {
+        bell(volume.current)
+        scene.current?.ringBell()
+      },
+      onRefresh: reload,
+    })
+    room.current = r
+    return () => {
+      r?.leave()
+      room.current = null
+    }
+  }, [])
+  useEffect(() => {
+    scene.current?.setMe(myName, saved.hue)
+    if (online) room.current?.announce({ name: myName, hue: saved.hue })
+  }, [online, myName, saved.hue])
+  useEffect(() => {
+    if (!db || !uid) return
+    const client = db
+    let stale = false
+    void (async () => {
+      const [prayers, total, mine] = await Promise.all([
+        // ponytail: 아멘 행을 통째로 받아 셈. 기도당 아멘이 수백 개가 되면 집계 뷰로 바꿀 것.
+        client.from('prayers').select('id,user_id,name,body,created_at,prayer_amens(user_id)').order('created_at', { ascending: false }).limit(50),
+        client.from('candles').select('*', { count: 'exact', head: true }),
+        client.from('candles').select('day').eq('user_id', uid).eq('day', kstToday()),
+      ])
+      if (stale) return
+      if (prayers.data)
+        setShared(prayers.data.map(r => {
+          const amens = r.prayer_amens as { user_id: string }[]
+          return { id: r.id, name: r.name, text: r.body, at: Date.parse(r.created_at), mine: r.user_id === uid, amens: amens.length, amened: amens.some(a => a.user_id === uid) }
+        }))
+      if (total.count !== null) setCandleTotal(total.count)
+      if (mine.data) setLitOnline(mine.data.length > 0)
+    })()
+    return () => {
+      stale = true
+    }
+  }, [uid, tick])
+  const candles = uid ? candleTotal : saved.candles
+  useEffect(() => { scene.current?.setCandles(candles) }, [candles])
   useEffect(() => { scene.current?.setVerse(VERSES[verse].text, VERSES[verse].ref) }, [verse])
   useEffect(() => {
     if (!autoVerse) return
@@ -174,7 +259,10 @@ export default function App() {
   }, [toast])
 
   // 음악
-  useEffect(() => { if (audio.current) audio.current.volume = saved.volume }, [saved.volume])
+  useEffect(() => {
+    volume.current = saved.volume
+    if (audio.current) audio.current.volume = saved.volume
+  }, [saved.volume])
   useEffect(() => {
     const a = audio.current!
     if (playing) a.play().catch(() => setPlaying(false))
@@ -199,23 +287,63 @@ export default function App() {
   const ring = () => {
     bell(saved.volume)
     scene.current?.ringBell()
+    room.current?.bell()
   }
-  const lightCandle = () => {
-    patch({ candles: saved.candles + 1, lastCandle: today() })
+  const changed = () => {
+    reload()
+    room.current?.refresh() // 다른 방문자 화면도 다시 읽게 함
+  }
+  const lightCandle = async () => {
+    if (db && uid) {
+      const { error } = await db.from('candles').insert({})
+      // 23505 = 오늘 이미 밝힘(DB의 하루 1회 제약). 그 외 오류만 실패로 알림.
+      if (error && error.code !== '23505') return setToast('촛불을 밝히지 못했어요. 잠시 후 다시 해 주세요.')
+      setLitOnline(true)
+      changed()
+    } else patch({ candles: saved.candles + 1, lastCandle: today() })
     setToast('작은 불빛 하나가 켜졌어요.')
   }
-  const submitPrayer = (e: FormEvent<HTMLFormElement>) => {
+  const submitPrayer = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
-    const f = new FormData(e.currentTarget)
+    const form = e.currentTarget
+    const f = new FormData(form)
     const text = String(f.get('text') ?? '').trim().slice(0, PRAYER_MAX)
     if (!text) return
     const name = String(f.get('name') ?? '').trim().slice(0, 20)
-    patch({ prayers: [{ id: Date.now(), name, text, at: Date.now() }, ...saved.prayers] })
-    e.currentTarget.reset()
+    if (db && uid) {
+      const { error } = await db.from('prayers').insert({ name, body: text })
+      if (error) return setToast('기도를 올리지 못했어요. 잠시 후 다시 해 주세요.')
+      changed()
+    } else patch({ prayers: [{ id: Date.now(), name, text, at: Date.now() }, ...saved.prayers] })
+    form.reset()
     setPrayerTab('read')
     scene.current?.gesture('pray')
-    setToast('기도를 이 기기에 간직했어요.')
+    setToast(uid ? '기도를 함께 나눴어요.' : '기도를 이 기기에 간직했어요.')
   }
+  const amen = async (p: PrayerView) => {
+    if (!db || !uid) return
+    const q = db.from('prayer_amens')
+    const { error } = p.amened ? await q.delete().eq('prayer_id', p.id).eq('user_id', uid) : await q.insert({ prayer_id: p.id })
+    if (!error) changed()
+  }
+  const removePrayer = async (p: PrayerView) => {
+    if (db && uid) {
+      const { error } = await db.from('prayers').delete().eq('id', p.id)
+      if (error) return setToast('지우지 못했어요.')
+      changed()
+    } else patch({ prayers: saved.prayers.filter(x => x.id !== p.id) })
+  }
+  const sendChat = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    const input = e.currentTarget.elements.namedItem('msg') as HTMLInputElement
+    const msg = input.value.replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX)
+    if (!msg) return
+    input.value = ''
+    room.current?.chat(msg)
+    scene.current?.say(null, msg)
+    log(myName, msg)
+  }
+  const prayers: PrayerView[] = uid ? shared : saved.prayers.map(p => ({ ...p, mine: true, amens: 0, amened: false }))
   const photo = async () => {
     const blob = await scene.current?.snapshot()
     if (!blob) return setToast('사진을 저장하지 못했어요.')
@@ -238,7 +366,7 @@ export default function App() {
     }
   }
 
-  const litToday = saved.lastCandle === today()
+  const litToday = uid ? litOnline : saved.lastCandle === today()
   const v = VERSES[verse]
   return (
     <main className={hud ? 'app' : 'app hud-off'}>
@@ -256,7 +384,7 @@ export default function App() {
           <button className={st.inside ? 'on' : ''} onClick={() => scene.current?.goto('inside')}>예배당 안</button>
         </div>
         <div className="top-right">
-          <span className="badge" title="실시간 연결은 준비 중이에요">혼자 머무는 중</span>
+          <span className={online ? 'badge on' : 'badge'} role="status">{online ? `함께 ${peerCount + 1}명` : '혼자 머무는 중'}</span>
           <button className="icon" onClick={() => setModal('settings')} aria-label="설정">⚙</button>
         </div>
       </header>
@@ -283,6 +411,7 @@ export default function App() {
       <p className="hint">W A S D · 방향키로 걷기 · 드래그로 둘러보기 · 휠로 거리 조절</p>
 
       <nav className="dock" aria-label="예배당 활동">
+        <button onClick={() => setChatOpen(o => !o)} aria-expanded={chatOpen}><i>💬</i>대화</button>
         <button onClick={() => setModal('candle')}><i>🕯</i>촛불</button>
         <button onClick={() => setModal('prayer')}><i>✍</i>기도</button>
         <button onClick={() => setModal('meditate')}><i>⏳</i>{endAt ? mmss(left) : '묵상'}</button>
@@ -290,11 +419,24 @@ export default function App() {
         <button onClick={ring}><i>🔔</i>종</button>
         <button onClick={photo}><i>📷</i>사진</button>
       </nav>
+      {chatOpen && (
+        <section className="chat" aria-label="대화">
+          <ul aria-live="polite">
+            {chatLog.map(m => (
+              <li key={m.id}><b>{m.who}</b> {m.text}</li>
+            ))}
+          </ul>
+          <form onSubmit={sendChat}>
+            <input name="msg" maxLength={CHAT_MAX} disabled={!online} autoComplete="off" autoFocus placeholder={online ? '따뜻한 한마디를 나눠요' : '연결되면 대화할 수 있어요'} />
+            <button type="submit" disabled={!online}>보내기</button>
+          </form>
+        </section>
+      )}
       <div className="toast" role="status">{toast}</div>
 
       <Modal open={modal === 'candle'} onClose={close} title="촛불 하나" sub="떠오르는 사람을 생각하며 조용히 불을 밝혀 보세요.">
         <div className={litToday ? 'candle lit' : 'candle'} aria-hidden><span /></div>
-        <p className="center">지금까지 <b>{saved.candles}</b>개의 촛불을 밝혔어요.</p>
+        <p className="center">{uid ? '모두 함께' : '지금까지'} <b>{candles}</b>개의 촛불을 밝혔어요.</p>
         <button className="primary" disabled={litToday} onClick={lightCandle}>{litToday ? '오늘의 촛불을 밝혔어요' : '촛불 밝히기'}</button>
         <p className="fine">하루에 하나씩. 밝힌 촛불은 강단 앞 촛대에 놓여요.</p>
       </Modal>
@@ -302,27 +444,28 @@ export default function App() {
       <Modal open={modal === 'prayer'} onClose={close} title="기도" sub="마음에 있는 것을 천천히 적어 보세요.">
         <div className="tabs" role="tablist">
           <button role="tab" aria-selected={prayerTab === 'write'} onClick={() => setPrayerTab('write')}>적기</button>
-          <button role="tab" aria-selected={prayerTab === 'read'} onClick={() => setPrayerTab('read')}>간직한 기도 {saved.prayers.length}</button>
+          <button role="tab" aria-selected={prayerTab === 'read'} onClick={() => setPrayerTab('read')}>{uid ? '함께 읽기' : '간직한 기도'} {prayers.length}</button>
         </div>
         {prayerTab === 'write' ? (
           <form onSubmit={submitPrayer}>
             <label>이름 <small>(선택)</small><input name="name" maxLength={20} placeholder="비워 두어도 괜찮아요" autoComplete="off" /></label>
             <label>오늘의 기도<textarea name="text" required maxLength={PRAYER_MAX} rows={6} placeholder="이 밤, 드리고 싶은 기도를 적어 주세요." /></label>
-            <p className="fine">지금은 이 기기에만 저장돼요. 연락처 같은 개인정보는 적지 마세요. (최대 {PRAYER_MAX}자)</p>
-            <button className="primary" type="submit">기도 간직하기</button>
+            <p className="fine">{uid ? '올린 기도는 방문한 모두가 읽을 수 있어요.' : '지금은 이 기기에만 저장돼요.'} 연락처 같은 개인정보는 적지 마세요. (최대 {PRAYER_MAX}자)</p>
+            <button className="primary" type="submit">{uid ? '기도 올리기' : '기도 간직하기'}</button>
           </form>
-        ) : saved.prayers.length ? (
+        ) : prayers.length ? (
           <ul className="prayers">
-            {saved.prayers.map(p => (
+            {prayers.map(p => (
               <li key={p.id}>
                 <p>{p.text}</p>
                 <small>{p.name || '이름 없이'} · {new Date(p.at).toLocaleDateString('ko')}</small>
-                <button className="link" onClick={() => patch({ prayers: saved.prayers.filter(x => x.id !== p.id) })}>지우기</button>
+                {uid && <button className={p.amened ? 'chip on' : 'chip'} aria-pressed={p.amened} onClick={() => amen(p)}>아멘 {p.amens}</button>}
+                {p.mine && <button className="link" onClick={() => removePrayer(p)}>지우기</button>}
               </li>
             ))}
           </ul>
         ) : (
-          <p className="center fine">아직 간직한 기도가 없어요.</p>
+          <p className="center fine">아직 기도가 없어요.</p>
         )}
       </Modal>
 
@@ -358,6 +501,10 @@ export default function App() {
       </Modal>
 
       <Modal open={modal === 'settings'} onClose={close} title="설정">
+        <label className="row">
+          <span>이름</span>
+          <input defaultValue={saved.name} maxLength={NAME_MAX} placeholder="이웃" autoComplete="off" onBlur={e => patch({ name: cleanName(e.target.value) })} />
+        </label>
         <Toggle label="내리는 눈" on={saved.snow} onChange={snow => patch({ snow })} />
         <Toggle label="말씀 스크린" on={saved.projector} onChange={projector => patch({ projector })} />
         <Toggle label="움직임 줄이기" on={saved.reduceMotion} onChange={reduceMotion => patch({ reduceMotion })} />

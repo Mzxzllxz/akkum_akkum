@@ -28,6 +28,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .brand b { font-size: 19px; color: var(--gold); letter-spacing: 0.02em; }
 .brand small, .fine, .sub { color: var(--dim); font-size: 13px; }
 .top-right { display: flex; align-items: center; gap: 8px; padding-right: 44px; }
+.badge.on { color: var(--gold); border-color: var(--gold); }
 .badge { font-size: 12px; color: var(--dim); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; }
 .icon { width: 36px; height: 36px; padding: 0; display: inline-grid; place-items: center; }
 .hud-toggle { position: absolute; top: 12px; right: 16px; }
@@ -52,8 +53,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .dock button { border: 0; background: none; backdrop-filter: none; border-radius: 16px; display: grid; justify-items: center; gap: 2px; min-width: 56px; padding: 8px 6px; font-size: 12px; }
 .dock button:hover { background: rgba(244, 236, 220, 0.08); }
 .dock i { font-style: normal; font-size: 20px; line-height: 1; }
-.toast { position: absolute; left: 50%; bottom: 100px; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 8px 16px; white-space: nowrap; max-width: calc(100vw - 32px); overflow: hidden; text-overflow: ellipsis; }
+.toast { position: absolute; left: 50%; top: 64px; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 8px 16px; white-space: nowrap; max-width: calc(100vw - 32px); overflow: hidden; text-overflow: ellipsis; }
 .toast:empty { display: none; }
+.chat { position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%); width: min(420px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 6px; }
+.chat ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.chat li { align-self: flex-start; background: var(--panel); border-radius: 12px; padding: 4px 10px; overflow-wrap: anywhere; }
+.chat li b { color: var(--gold); margin-right: 4px; }
+.chat form { flex-direction: row; gap: 6px; }
+.chat input { flex: 1; min-width: 0; border-radius: 999px; padding: 8px 14px; background: var(--panel); }
+.row input:not([type]) { width: 160px; padding: 6px 10px; }
+.prayers .chip { padding: 2px 10px; margin-right: 8px; font-size: 13px; }
 .hud-off > :not(.scene, .hud-toggle, dialog) { display: none; }
 
 .modal { border: 1px solid var(--line); border-radius: 20px; background: #101c2b; color: var(--ink); padding: 0; width: min(440px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); }
